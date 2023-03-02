@@ -4,7 +4,11 @@ import mindspore.ops as ops
 import mindspore.numpy as np
 import mindspore.ops.function as F
 
+import numpy
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import pairwise_distances
+from sklearn.cluster import KMeans
+import argparse
 
 
 _SQRT2=2**0.5
@@ -33,7 +37,8 @@ class BasicConv(nn.Cell):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, group=1, relu=True, bn=True, bias=False):
         super(BasicConv, self).__init__()
         self.out_channels = out_planes
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, group=group, has_bias=bias)
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, pad_mode='pad'
+                              , dilation=dilation, group=group, has_bias=bias)
         self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
         self.relu = nn.ReLU() if relu else None
 
@@ -48,7 +53,9 @@ class BasicConv(nn.Cell):
 
 class ChannelPool(nn.Cell):
     def construct(self, x):
-        return ops.Concat(axis=1)(ops.ExpandDims()(ops.ArgMaxWithValue(axis=1)(x)[0], 1), ops.ArgMaxWithValue(axis=1)(ops.ReduceMean()(x, 1)))
+        return ops.Concat(axis=1)([
+            ops.Cast()(ops.ExpandDims()(ops.ArgMaxWithValue(axis=1)(x)[1], 1), ms.float32),
+            ops.ExpandDims()(ops.ReduceMean()(x, 1), 1)])
 
 
 class SpatialGate(nn.Cell):
@@ -143,7 +150,7 @@ class AggregatLayer(nn.Cell):
     def construct(self, x, adj, mask=None):
         B, N, _ = adj.shape
 
-        out = ops.MatMul()(adj, x)
+        out = ops.BatchMatMul()(adj, x)
         out = out / ops.clip_by_value(adj.sum(axis=-1, keepdims=True), clip_value_min=ms.Tensor(1, ms.float32))
 
         out = self.node_trans(out)
@@ -161,7 +168,7 @@ class GraphEncoder(nn.Cell):
 
     def __init__(self, args, instance_dim):
         super(GraphEncoder, self).__init__()
-        ms.set_context(device_id=args.gpu)
+        # ms.set_context(device_id=args.gpu)
 
         self.args = args
         self.L = args.graph_dim
@@ -200,7 +207,7 @@ class GraphEncoder(nn.Cell):
         # nodes = instances
 
         if self.args.graph_adge == 'naive':
-            return ops.ReduceMean(axis=0, keepdims=True)(H), 0
+            return ops.ReduceMean(keep_dims=True)(H, 0), 0
         else:
             N_0, A_0 = nodes, self.init_adj_matrix(nodes)
 
@@ -213,16 +220,18 @@ class GraphEncoder(nn.Cell):
         # S = self.cluster_classify(N)
         # S = nn.Softmax(axis=-1)(S)
 
-        centers = kmeans(N.view(b_s * num_desc, -1), self.t)
+        centers = KMeans(n_clusters=self.t, random_state=0, n_init="auto").fit(N.view(b_s * num_desc, -1)).cluster_centers_
+        centers = ms.Tensor(centers)
+
         # centers = self.get_S_by_kmeans(N.view(b_s * num_desc, -1))
         cluster = ((N.view(b_s * num_desc, -1)[:, None, :] - centers[None, :, :])**2).sum(-1).argmin(1)
 
         depth, on_value, off_value = self.t, ms.Tensor(1.0, ms.float32), ms.Tensor(0.0, ms.float32)
         S = ops.OneHot()(cluster.view(b_s, num_desc), depth, on_value, off_value)
 
-        cluster_num = ops.ExpandDims()(S.sum(axis=1), axis=-1)
-        out = ops.MatMul()(S.transpose(1, 2), N)
-        out = (out + ops.ExpandDims()(centers, axis=0)) / (cluster_num + 1)
+        cluster_num = ops.ExpandDims()(S.sum(axis=1), -1)
+        out = ops.BatchMatMul()(S.transpose((0, 2, 1)), N)
+        out = (out + ops.ExpandDims()(centers, 0)) / (cluster_num + 1)
 
         out = out.view(b_s, -1)
 
@@ -231,19 +240,18 @@ class GraphEncoder(nn.Cell):
     # GNN methods
     def convert_bag_to_graph_mine_(self, bag):
         b_s, num, C = bag.shape
-        left = F.broadcast_to(ops.ExpandDims()(bag, axis=1), (-1, num, -1, -1)).reshape(-1, C)
-        right = F.broadcast_to(ops.ExpandDims()(bag, axis=2), (-1, -1, num, -1)).reshape(-1, C)
+        left = F.broadcast_to(ops.ExpandDims()(bag, 1), (-1, num, -1, -1)).reshape(-1, C)
+        right = F.broadcast_to(ops.ExpandDims()(bag, 2), (-1, -1, num, -1)).reshape(-1, C)
 
-        metric = nn.RootMeanSquareDistance(symmetric=False, distance_metric="euclidean")
-        metric.clear()
-        distance = metric.update(left, right, 0)
+        distance = np.norm(left-right, axis=-1, ord=2)
+
         distance = distance.view(b_s, -1)
 
         sorted_dists, incide = ops.Sort(axis=-1, descending=False)(distance)
 
         NUM_ = num * num
         index = int(self.num_adj_parm * NUM_)
-        n = ops.ExpandDims()(sorted_dists[:,index], axis=1)
+        n = ops.ExpandDims()(sorted_dists[:,index], 1)
 
         A = ops.Cast()(distance < n, ms.float32)
         A = A.view(b_s, num, num)
@@ -257,7 +265,7 @@ class GraphEncoder(nn.Cell):
 
 def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, has_bias=False)
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, has_bias=False, pad_mode='pad')
 
 
 class DropBlock(nn.Cell):
@@ -302,7 +310,8 @@ class DropBlock(nn.Cell):
                 np.tile(np.arange(self.block_size), self.block_size),  # - left_padding
             ]
         ).T
-        offsets = ops.Concat(1)(ops.Zeros()((self.block_size ** 2, 2)), offsets)
+
+        offsets = ops.Concat(1)([ops.Zeros()((self.block_size ** 2, 2)), offsets])
 
         if nr_blocks > 0:
             non_zero_idxs = np.tile(non_zero_idxs, (self.block_size ** 2, 1))
@@ -438,7 +447,7 @@ class ResNet(nn.Cell):
                 layer = block(self.inplanes, planes, drop_rate=drop_rate, use_se=self.use_se,use_maxpool=use_maxpool)
             layers.append(layer)
 
-        return nn.SequentialCell(*layers)
+        return nn.SequentialCell(layers)
 
     def construct(self, x, is_feat=False):
         x = self.layer1(x)
@@ -467,12 +476,12 @@ class ResNet(nn.Cell):
         return x, f3, gate
 
 
-def BackBone_ResNet12(keep_prob=1.0, avg_pool=False, drop_rate=0.1, dropblock_size=5, args=None, **kwargs):
+def BackBone_ResNet12(keep_prob=0.9, avg_pool=False, drop_rate=0.1, dropblock_size=5, args=None, **kwargs):
     model = ResNet(BasicBlock, [1, 1, 1, 1], keep_prob=keep_prob, avg_pool=avg_pool, args=None, **kwargs)
     return model
 
 
-def BackBone_ResNet50(keep_prob=1.0, avg_pool=False, **kwargs):
+def BackBone_ResNet50(keep_prob=0.9, avg_pool=False, **kwargs):
     model = ResNet(BasicBlock, [3, 4, 6, 3], keep_prob=keep_prob, avg_pool=avg_pool, **kwargs)
     return model
 
@@ -500,6 +509,7 @@ def proto_forward_log_pred(all_feature_vector,dim,args):
     episode_size, shot_num, query_num, way = args.episode_size, args.shot, args.query, args.way
 
     # b_s = all_feature_vector.shape[0]
+    all_feature_vector, mask, graph_loss = all_feature_vector
     all_feature_vector = all_feature_vector.view(args.episode_size, way*(shot_num+query_num), dim)
 
     log_prediction = []
@@ -513,7 +523,7 @@ def proto_forward_log_pred(all_feature_vector,dim,args):
 
         distance = ops.Neg()(((centroid-query)**2).sum(axis=-1)).view(way*query_num,way)
 
-        log_prediction.append(nn.LogSoftmax(axis=1)(distance))
+        log_prediction.append(nn.LogSoftmax(axis=1)(distance.astype(ms.float32)))
 
     return ops.Concat()(log_prediction)
 
@@ -640,7 +650,8 @@ class DualAttentionNet(Proto_Model):
         _, index = ops.TopK()(mask, positive_num)
 
         choose_mask = ops.ZerosLike()(mask)
-        choose_mask = ops.scatter_nd(index, choose_mask, ops.OnesLike()(mask))
+        choose_mask = ops.tensor_scatter_elements(ops.ZerosLike()(mask), index, ops.OnesLike()(index).astype(np.float32), 1)
+
 
         choose_mask = choose_mask.reshape(b_s, 1, H, W)
         key_descriptors = ops.masked_select(feature_map, choose_mask>0).reshape(b_s, positive_num, C)
@@ -652,8 +663,11 @@ class DualAttentionNet(Proto_Model):
     def get_feature_vector(self, inp):
         args = self.args
 
-        episode_size, one_episode_count, C,H,W = inp.shape
-        inp = inp.view(episode_size*one_episode_count, C, H, W)
+        try:
+            episode_size, one_episode_count, C,H,W = inp.shape
+            inp = inp.view(episode_size*one_episode_count, C, H, W)
+        except:
+            N, C, H, W = inp.shape
 
         feature_map, feature_map_up, mask = self.feature_extractor(inp)
 
@@ -662,7 +676,7 @@ class DualAttentionNet(Proto_Model):
         graph_loss = 0
 
         if args.soft_stream == 'True':
-            avgpool = ops.AvgPool(kernel_size=feature_map.size(-1))
+            avgpool = ops.AvgPool(kernel_size=feature_map.shape[-1])
 
             gap_vector = avgpool(feature_map)
             gap_vector = gap_vector.view((b_s, -1))
@@ -676,7 +690,7 @@ class DualAttentionNet(Proto_Model):
             elif args.soft_pool == 'GMP':
                 glb_vector = gmp_vector
             else:
-                glb_vector = ops.Concat(axis=-1)(gap_vector, gmp_vector)
+                glb_vector = ops.Concat(axis=-1)([gap_vector, gmp_vector])
 
         if self.use_hard_stream == False:
             return glb_vector, mask, 0
@@ -684,7 +698,7 @@ class DualAttentionNet(Proto_Model):
             instance_vector, graph_loss, key_descriptors = self.get_instance_feature_attGraph(args.positive_num, feature_map_up, mask)
 
             if args.soft_stream == 'True':
-                final_feature = ops.Concat(axis=1)(instance_vector, glb_vector)
+                final_feature = ops.Concat(axis=1)([instance_vector, glb_vector.astype(ms.float64)])
             else:
                 final_feature = instance_vector
 
@@ -701,4 +715,5 @@ class DualAttentionNet(Proto_Model):
             args = self.args)
 
         return log_prediction, masks, graph_loss
+
 
